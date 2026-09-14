@@ -12,6 +12,8 @@ variables. Both `<rss><channel><item>` and Atom `<feed><entry>` documents are su
 titles have HTML tags stripped and whitespace collapsed, and each item carries a short relative
 age such as `5M`, `2H` or `3D` computed from its `pubDate` / `updated` / `published` element.
 
+![RSS Reader Display](./docs/board-display.png)
+
 ## Template Variables
 
 ```

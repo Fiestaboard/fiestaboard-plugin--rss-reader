@@ -137,6 +137,14 @@
       ]
     }
   ],
+  "screenshots": [
+    {
+      "src": "docs/board-display.png",
+      "alt": "RSS Reader displayed on a Vestaboard",
+      "caption": "Display the newest headlines from any RSS 2.0 or Atom feed",
+      "primary": true
+    }
+  ],
   "demo": {
     "flagship": {
       "name": "RSS Reader Demo",
