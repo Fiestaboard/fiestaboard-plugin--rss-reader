@@ -13,12 +13,29 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from src.devices import DEVICE_DIMENSIONS, MAX_NOTES_PER_AXIS, NOTE_ROWS
 from src.plugins.base import PluginBase, PluginResult
 
 logger = logging.getLogger(__name__)
 
 USER_AGENT = "FiestaBoard (https://github.com/FiestaBoard/FiestaBoard)"
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
+
+DEFAULT_MAX_ITEMS = 5
+
+# The most headlines any board could ever have room for: a full 8x8 note
+# array (the largest FiestaPanel) minus the one row this plugin always
+# spends on the feed title. Derived from the platform's own geometry limits
+# rather than an arbitrary literal, so it never falls behind board.rows the
+# way the old fixed cap of 10 did (a 24-row panel needs 23 headlines and
+# could only ever get 10).
+MAX_ITEMS_CEILING = MAX_NOTES_PER_AXIS * NOTE_ROWS - 1
+
+# Honesty bounds for manifest.json's max_lengths (measured in tiles). Kept in
+# sync with the "feed_title", "title" and "items.*.link" declarations there.
+FEED_TITLE_MAX_LENGTH = 22
+TITLE_MAX_LENGTH = 66
+LINK_MAX_LENGTH = 200
 
 _TAG_RE = re.compile(r"<[^>]+>")
 
@@ -123,9 +140,13 @@ class RssReaderPlugin(PluginBase):
         elif not feed_url.startswith(("http://", "https://")):
             errors.append("Feed URL must start with http:// or https://")
 
-        max_items = config.get("max_items", 5)
-        if not isinstance(max_items, int) or isinstance(max_items, bool) or not 1 <= max_items <= 10:
-            errors.append("Max items must be a whole number between 1 and 10")
+        max_items = config.get("max_items", DEFAULT_MAX_ITEMS)
+        if (
+            not isinstance(max_items, int)
+            or isinstance(max_items, bool)
+            or not 1 <= max_items <= MAX_ITEMS_CEILING
+        ):
+            errors.append(f"Max items must be a whole number between 1 and {MAX_ITEMS_CEILING}")
 
         errors.extend(self._validate_refresh_seconds(config))
         return errors
@@ -145,11 +166,29 @@ class RssReaderPlugin(PluginBase):
             response.raise_for_status()
 
             feed_title, items = parse_feed(response.content)
+            # Truncate to the manifest's declared max_length so a long feed
+            # title can never violate the honesty contract page templates
+            # rely on for sizing.
+            feed_title = feed_title[:FEED_TITLE_MAX_LENGTH]
 
-            max_items = self.config.get("max_items", 5)
+            max_items = self.config.get("max_items", DEFAULT_MAX_ITEMS)
             if not isinstance(max_items, int) or isinstance(max_items, bool):
-                max_items = 5
-            items = items[: max(1, min(10, max_items))]
+                max_items = DEFAULT_MAX_ITEMS
+
+            # self.board is None outside a board-scoped render (legacy
+            # callers, unit tests); assume a Flagship rather than crash.
+            board = self.board
+            board_rows = board.rows if board else DEVICE_DIMENSIONS["flagship"].rows
+            board_cols = board.cols if board else DEVICE_DIMENSIONS["flagship"].cols
+
+            # One row is always spent on the feed title, so a board can show
+            # at most rows - 1 headlines. The configured max_items and the
+            # platform-wide ceiling are both upper bounds too, so whichever
+            # is smallest wins -- the point is that the board's own size can
+            # never be the thing capping this below what the user asked for.
+            board_cap = max(1, board_rows - 1)
+            effective_cap = max(1, min(MAX_ITEMS_CEILING, max_items, board_cap))
+            items = items[:effective_cap]
 
             if not items:
                 return PluginResult(available=False, error="Feed contains no items")
@@ -157,8 +196,14 @@ class RssReaderPlugin(PluginBase):
             now = datetime.now(timezone.utc)
             for item in items:
                 item["age"] = format_age(item.pop("published"), now)
+                # Same honesty guarantee as feed_title above: RSS headlines
+                # and links are arbitrary-length third-party text.
+                item["title"] = item["title"][:TITLE_MAX_LENGTH]
+                item["link"] = item["link"][:LINK_MAX_LENGTH]
 
             newest = items[0]
+            formatted_lines = [feed_title[:board_cols]] + [item["title"][:board_cols] for item in items]
+
             return PluginResult(
                 available=True,
                 data={
@@ -169,6 +214,7 @@ class RssReaderPlugin(PluginBase):
                     "item_count": len(items),
                     "items": items,
                 },
+                formatted_lines=formatted_lines,
             )
 
         except ET.ParseError as e:
@@ -180,7 +226,11 @@ class RssReaderPlugin(PluginBase):
 
     def get_formatted_display(self) -> Optional[List[str]]:
         """Feed title on line 1, then one item title per remaining line."""
-        result = self.get_data()
+        # Pass self.board through explicitly: get_data(None) would rebind
+        # self.board to None for the duration of the underlying fetch_data()
+        # call, which would fetch a Flagship-sized item count no matter how
+        # big the board actually bound here is.
+        result = self.get_data(self.board)
         if not result.available or not result.data:
             return None
 

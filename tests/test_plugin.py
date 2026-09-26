@@ -141,7 +141,9 @@ class TestRssReaderPlugin:
 
         assert result.available is True
         assert result.error is None
-        assert result.data["feed_title"] == "Hacker News: Front Page"
+        # Truncated to the manifest's declared max_length (22 tiles); the
+        # feed's actual title is 24 characters.
+        assert result.data["feed_title"] == "Hacker News: Front Pag"
         assert result.data["title"] == "Nike exits the S&P 100 after 18 years"
         assert result.data["age"] == "12M"
         assert result.data["link"] == "https://fortune.com/nike"
@@ -177,7 +179,8 @@ class TestRssReaderPlugin:
         result = plugin.fetch_data()
 
         assert result.available is True
-        assert result.data["feed_title"] == "Recent Commits to FiestaBoard:main"
+        # Truncated to the manifest's declared max_length (22 tiles).
+        assert result.data["feed_title"] == "Recent Commits to Fies"
         assert result.data["title"] == "docs(updating): document the beta channel (#1989)"
         assert result.data["link"] == "https://github.com/commit/e13a3c7"
         assert result.data["age"] == "5H"
@@ -205,8 +208,72 @@ class TestRssReaderPlugin:
 
         assert plugin.fetch_data().data["item_count"] == 5
 
+        # No board is bound here, so fetch_data assumes a Flagship (6 rows)
+        # rather than the platform-wide ceiling -- item_count is capped at
+        # rows - 1 = 5, not by the feed's own 6 available items.
         plugin.config = {**CONFIG, "max_items": 50}
-        assert plugin.fetch_data().data["item_count"] == 6
+        assert plugin.fetch_data().data["item_count"] == 5
+
+    @patch("plugins.rss_reader.requests.get")
+    def test_fetch_grows_item_count_on_a_taller_board(self, mock_get, plugin):
+        """A board taller than a Flagship must be able to expose more headlines.
+
+        This is the board-adaptivity fix: the old code capped max_items at a
+        flat 10 regardless of board size, so a tall note array (which needs
+        rows - 1 headlines) could never get enough to fill past row 11.
+        """
+        many_items = "".join(
+            f"<item><title>Headline {i}</title><link>https://example.com/{i}</link></item>" for i in range(30)
+        )
+        feed = f"""<?xml version="1.0"?>
+<rss version="2.0"><channel><title>Big Feed</title>{many_items}</channel></rss>
+"""
+        mock_get.side_effect = _mock_get(feed)
+        plugin.config = {**CONFIG, "max_items": 23}
+
+        with plugin._bound_board(BoardContext("note_array", rows=24, cols=15)):
+            result = plugin.fetch_data()
+
+        # rows - 1 = 23 headlines, the platform-wide ceiling -- not the old
+        # hardcoded 10.
+        assert result.data["item_count"] == 23
+        assert len(result.formatted_lines) == 24
+        assert all(len(line) <= 15 for line in result.formatted_lines)
+
+    @patch("plugins.rss_reader.requests.get")
+    def test_fetch_sets_formatted_lines_bounded_to_board(self, mock_get, plugin):
+        mock_get.side_effect = _mock_get(RSS_XML)
+
+        with plugin._bound_board(BoardContext("note", rows=3, cols=15)):
+            result = plugin.fetch_data()
+
+        assert result.formatted_lines == [
+            "Hacker News: Fr",
+            "Nike exits the ",
+            "Show HN: Is It ",
+        ]
+
+    @patch("plugins.rss_reader.requests.get")
+    def test_fetch_truncates_absurdly_long_fields_to_manifest_max_lengths(self, mock_get, plugin):
+        """RSS headlines/links are arbitrary-length third-party text; the
+        manifest's max_lengths must stay honest no matter how absurd the feed."""
+        absurd_title = "X" * 5000
+        absurd_link = "https://example.com/" + ("y" * 5000)
+        feed = f"""<?xml version="1.0"?>
+<rss version="2.0"><channel><title>{"T" * 5000}</title>
+<item><title>{absurd_title}</title><link>{absurd_link}</link></item>
+</channel></rss>
+"""
+        mock_get.side_effect = _mock_get(feed)
+
+        result = plugin.fetch_data()
+
+        assert len(result.data["feed_title"]) <= 22
+        assert len(result.data["title"]) <= 66
+        assert len(result.data["link"]) <= 200
+        assert len(result.data["items"][0]["title"]) <= 66
+        assert len(result.data["items"][0]["link"]) <= 200
+        assert all(len(line) <= 22 for line in result.formatted_lines)
 
     @patch("plugins.rss_reader.requests.get")
     def test_fetch_sends_user_agent_and_timeout(self, mock_get, plugin):
@@ -287,10 +354,15 @@ class TestRssReaderPlugin:
         errors = plugin.validate_config({"feed_url": "ftp://example.com/feed"})
         assert any("http://" in e for e in errors)
 
-    @pytest.mark.parametrize("max_items", [0, 11, "5", 2.5, True])
+    @pytest.mark.parametrize("max_items", [0, 24, "5", 2.5, True])
     def test_validate_config_bad_max_items(self, plugin, max_items):
         errors = plugin.validate_config({**CONFIG, "max_items": max_items})
         assert any("Max items" in e for e in errors)
+
+    def test_validate_config_allows_up_to_the_largest_board(self, plugin):
+        """23 headlines is what a full 24-row note array needs (rows - 1);
+        the old hardcoded ceiling of 10 made this unconfigurable."""
+        assert plugin.validate_config({**CONFIG, "max_items": 23}) == []
 
     def test_validate_config_refresh_below_minimum(self, plugin):
         errors = plugin.validate_config({**CONFIG, "refresh_seconds": 60})
